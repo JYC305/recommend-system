@@ -1,0 +1,379 @@
+---
+title: "Amazon review data"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    extra_dependencies: ["kotex"]
+  html_document: default
+date: "2023-12-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(tinytex.verbose = TRUE)
+```
+
+# 1. 작업 환경 구성
+## 1.1 패키지 추가
+
+```{r, message=FALSE, warning=FALSE}
+library(readr)
+library(rmarkdown)
+library(knitr)
+library(recommenderlab)
+library(dplyr)
+library(tm)
+library(SnowballC)
+library(class)
+library(dbscan)
+library(proxy)
+library(caTools)
+library(tidyverse)
+library(tinytex)
+```
+
+
+## 1.2 데이터 불러오기
+* **rating_data** : 318명의 사용자(행)가 513개의 게임(열)에 대하여 평가한 평점(1~5점)으로 구성된 데이터
+
+* **title_list** : 게임의 고유 id와 게임 타이틀에 대한 데이터
+
+* Jianmo Ni, Jiacheng Li, and Julian McAuley, Justifying recommendations using distantly-labeled reviews and fined-grained aspects. Empirical Methods in Natural Language Processing (EMNLP), 2019.에서 제공하는 1996.5 ~ 2018.10 기간 동안의 아마존 리뷰 데이터를 전처리하여 만든 데이터
+  
+```{r}
+
+rating_data <- read.csv('rating_data.csv')
+row.names(rating_data) <- rating_data[,1]
+rating_data <- rating_data[,-1]
+
+title_list <- read.csv('title_list.csv')
+title_list <- title_list[,-1]
+
+rating_data[1:10,1:10]
+```
+
+
+#
+## 1.3 학습 데이터와 평가 데이터 나누기
+
+* 평점 데이터를 recommenderlab 패키지 사용에 적합한 형태로 변환
+
+  * realRatingMatrix : 실수 평점
+  
+  * binaryRatingMatrix : 이진 평점
+  
+* 분할 비율을 정하여 평점 행렬을 행을 기준으로 학습 데이터와 평가 데이터로 분할
+
+```{r}
+
+R <- rating_data %>% as.matrix()
+
+R <- as(R, "realRatingMatrix")
+
+set.seed(5)
+rate <- 0.8
+random_index <- sample(1:nrow(R), size = nrow(R)*rate, replace = F)
+
+train_data <- R[random_index,]
+test_data <- R[-random_index,]
+
+```
+
+
+# 2. 협업 필터링
+## 2.1 유사도 계산
+
+* **similarity**를 통해 사용자 또는 아이템 간의 유사도를 계산
+
+  * method : 유사도(cosine, pearson, jaccard)
+  
+  * cosine 유사도의 경우 (-1,1)이 아닌 (0,1)로 보정된 값을 출력
+  
+```{r}
+similarity(R[1:10], R[1:10], method = "pearson")
+```
+
+
+## 2.2 사용자 기반 협업 필터링 모델링을 통한 예측
+
+* **recommenderRegistry**를 통해 모델링 방법과 데이터 형태를 입력
+
+* **Recommender**에서 method를 "UBCF"로 하여 학습 데이터를 통해 모델을 생성
+
+* **Recommender**(method = "UBCF")에서 list를 통해 조절 가능한 모수
+
+  * method : 유사도(cosine, pearson, jaccard)
+  
+  * nn : 학습 간 최근접 이웃의 수
+
+  * weighted : 유사도를 가중치로 부여하는지 여부
+
+  * normalize : 정규화 방법(center, Z-score)
+
+* **predict**를 통해 위에서 만든 모델을 바탕으로 평가 데이터에 대한 예측을 수행
+  
+  * n : 추천 받을 아이템의 개수(예상 평점이 가장 높은 순으로 추천)
+  
+  * type : 추천 결과의 형태(topNList, ratings, ratingMatrix)
+
+* **getList**를 통해 사용자별로 추천하는 게임 id를 확인
+
+  * 예제에서는 첫번째 사용자에 대한 추천 게임을 확인
+
+```{r}
+model_registry <- recommenderRegistry$get_entries("UBCF", dataType = "realRatingMatrix")
+
+model_user_based <- Recommender(data = train_data, method = "UBCF",
+                                list(method = "cosine", nn = 25, weighted = T))
+
+predict_user_based <- predict(model_user_based, newdata = test_data, n = 10, type = "topNList")
+
+getList(predict_user_based)[[1]]
+```
+```{r}
+R1 <- as(train_data[1],"matrix")
+R1_1 <- R1[,R1[1,] >= 0]
+R1_2 <- na.omit(R1_1)
+R1_2 <- as.data.frame(R1_2)
+
+rownames(R1_2)[1]
+
+for (i in 1:dim(R1_2[1])) {
+  j = rownames(R1_2)[i]
+  rownames(R1_2)[i] <- title_list[title_list[,1] == j,2][1]
+}
+
+colnames(R1_2)[1] <- c("평점")
+R1_2
+```
+
+#
+* 추천 결과를 보기 편하게 게임 id에서 게임 타이틀로 변경
+
+```{r}
+recommend_user_based_list <- data.frame()
+
+for (i in 1:10) {
+  j = getList(predict_user_based)$`0`[i]
+  recommend_user_based_list[i,1] <- title_list[title_list[,1] == j,2][1]
+}
+  
+colnames(recommend_user_based_list) <- c("추천 게임")
+
+recommend_user_based_list
+```
+
+#
+## 2.3 아이템 기반 협업 필터링 모델링을 통한 예측
+
+* **recommenderRegistry**를 통해 모델링하는 방법과 데이터의 형태를 입력
+
+* **Recommender**에서 method를 "IBCF"로 하여 학습 데이터를 통해 모델을 생성
+
+  * "IBCF"에서 최근접 이웃의 수는 k를 통해 조절
+
+```{r}
+model_registry <- recommenderRegistry$get_entries("IBCF", dataType = "realRatingMatrix")
+
+model_item_based <- Recommender(data = train_data, method = "IBCF",
+                                list(method = "pearson", k = 25))
+
+predict_item_based <- predict(model_item_based, newdata = test_data, n = 10, type = "topNList")
+
+recommend_item_based_list <- data.frame()
+
+for (i in 1:10) {
+  j = getList(predict_item_based)$`0`[i]
+  recommend_item_based_list[i,1] <- title_list[title_list[,1] == j,2][1]
+}
+
+colnames(recommend_item_based_list) <- c("추천 게임")
+
+recommend_item_based_list
+```
+
+
+#
+# 3. 잠재 요인 모델(Funk SVD)
+
+* **recommenderRegistry**를 통해 모델링하는 방법과 데이터의 형태를 입력
+
+* **Recommender**(method = "SVDF")에서 list를 통해 조절 가능한 모수
+
+  * k : 잠재 요인의 수
+  
+  * gamma : learning rate
+  
+  * lambda : 정규화 항의 계수
+  
+  * min_improvement : 오차 항의 수렴 기준
+  
+  * min_ephochs : 잠재요인별 업데이트 간 경사하강법 최소 반복횟수
+  
+  * max_ephochs : 잠재요인별 업데이트 간 경사하강법 최대 반복횟수
+
+* **model_svd@model$svd**에서 잠재 요인의 수 k에 대하여 인수분해된 사용자 요인 행렬 U(n×k)와 아이템 요인 행렬 V(m×k) 확인 가능
+
+```{r}
+model_registry <- recommenderRegistry$get_entries("SVDF", dataType = "realRatingMatrix")
+
+model_svdf <- Recommender(data = train_data, method = "SVDF", 
+                          list(k = 50, gamma = 0.015, lambda = 0.001,
+                               min_improvement = 1e-6, min_epochs = 50, max_epochs = 1000))
+
+model_svdf@model$svd$V[1:5,1:5]
+```
+
+
+* **predict**에서 학습된 모델을 통해 평가 데이터의 평점 행렬 추정
+
+  * 학습 데이터에서의 아이템 요인 행렬 V를 고정시킨 상태에서 평가 데이터의 사용자 요인 행렬 u에 대한 uV'로서 평점 행렬을 추정
+
+```{r}
+predict_svdf <- predict(model_svdf, newdata = test_data, type = "topNList")
+
+recommend_svdf_list <- data.frame()
+
+for (i in 1:10) {
+  j = getList(predict_svdf)$`0`[i]
+  recommend_svdf_list[i,1] <- title_list[title_list[,1] == j,2][1]
+}
+
+colnames(recommend_svdf_list) <- c("추천 게임")
+
+recommend_svdf_list
+
+```
+
+
+# 4. 추천 시스템 평가
+## 4.1 k-fold 교차검증을 통한 매개변수 선택
+
+* **eveluationScheme**를 통해 학습 데이터 세트와 평가 데이터 세트로 분할
+
+  * method : 데이터 분할 방법(split, cross-validation, bootstrap)
+
+  * train : split 방법에서 학습 데이터 세트의 비율
+
+  * k : cross-validation 방법에서 k fold의 수, bootstrap 방법에서 반복 횟수
+
+  * goodRating : 좋은 평점이라고 생각되는 기준 점수
+
+  * given : 평가 데이터 세트에서 예측을 수행하기 위해 주어지는 관측치의 수
+  
+* **evaluationScheme**를 통해 나누어진 데이터 세트 총 3가지 종류
+  
+  * trining : 모델을 훈련시킬 때 사용하는 학습 데이터 세트
+  
+  * known : 훈련된 모델을 통해 예측을 수행할 평가 데이터 세트("given"을 통해 조절 가능)
+  
+  * unknown : 훈련된 모델을 통해 예측된 값이 정답인지를 판단하기 위한 데이터 세트
+  
+  * 평점 행렬에서는 예측변수와 반응변수의 명확한 구분이 없기 때문에 같은 행에서 "given" 값만큼의 평점을 "known"으로 남기고 나머지를 "unknown"으로 처리하여 평가 데이터를 생성
+  
+* k fold 교차검증으로 최적의 모수를 찾기 위하여 **evaluationScheme**를 통해 학습 데이터 세트에 대한 k fold 데이터 세트를 생성
+
+* **getData**를 통해 종류별 데이터 세트 호출
+
+```{r}
+kfold_data_set <- evaluationScheme(data = R, method = "cross-validation",
+                                   k = 10, given = 5, goodRating = 3)
+
+train_data_set <- getData(kfold_data_set, "train")
+known_data_set <- getData(kfold_data_set, "known")
+unknown_data_set <- getData(kfold_data_set, "unknown")
+```
+
+
+#
+* **Recommender**를 통해 서로 다른 모수들에 대한 여러 개의 모델을 생성
+
+  * k fold 데이터 세트 중에서 "train" 세트를 이용하여 각 모델을 학습
+
+* **predict**를 통해 k fold 데이터 세트 중에서 "known" 세트를 이용하여 모델별 평점 예측을 수행
+
+* **calcPredictionAccuracy**를 통해 예측 값과 "unknwon" 세트의 실제 값과 비교하여 RMSE, MSE, MAE를 계산
+
+```{r}
+accuracy_CF_table <- data.frame(matrix(0,8,5))
+colnames(accuracy_CF_table) <- c("RMSE", "MSE", "MAE", "similarity", "k")
+index <- 1
+
+for (s in c("cosine","pearson")){
+  for (b in c(5, 10, 15, 20)) {
+    model_CF <- Recommender(data = train_data_set,
+                            method = "IBCF", parameter = list(method = s, k = b))
+    
+    predict_CF <- predict(model_CF, newdata = known_data_set, n = 10, type = "ratings")
+    
+    accuracy_CF_table[index,1:3] <- calcPredictionAccuracy(predict_CF, unknown_data_set)
+    accuracy_CF_table[index,4] <- s
+    accuracy_CF_table[index,5] <- b
+    index <- index+1
+  }
+}
+
+accuracy_CF_table
+```
+
+
+#
+* RMSE가 가장 작은 모델을 최적의 모델로 선정
+```{r}
+best_prameters <- data.frame(0,0)
+colnames(best_prameters) <- c("similarity", "k")
+
+best_index <- which.min(accuracy_CF_table[,1])
+
+best_prameters[1,1] <- accuracy_CF_table[best_index,4]
+best_prameters[1,2] <- accuracy_CF_table[best_index,5] %>% as.numeric()
+
+best_prameters
+```
+
+
+#
+## 4.2 ROC 곡선을 통한 모델 비교
+
+* **evaluate**를 통해 k fold 데이터 셋에 대한 모델별 예측 평점과 실제 평점을 비교하여 오차 행렬(Confusion Matrix)을 생성
+
+  * n : 사용자에게 추천할 아이템의 수
+
+```{r, results = FALSE}
+model_list <- list(model_1 = list(name = "UBCF", param = list(nn = 20)),
+                   model_2 = list(name = "UBCF", param = list(nn = 100)))
+
+evaluate_result <- evaluate(x = kfold_data_set, method = model_list,
+                            n = c(10, 50, 100, 250, 500))
+```
+
+
+#
+* **getConfusionMatrix**를 통해 모델별 오차 행렬을 추출
+
+* **Reduce**를 통해 10 fold에 대한 분류 성능 평가지표의 합을 계산하여 평균값을 확인
+
+```{r}
+accuracy_colnames <- c("TP", "FP", "FN", "TN", "N", "precision", "recall", "TPR", "FPR")
+
+accuracy_model_1 <- getConfusionMatrix(evaluate_result[[1]])
+accuracy_model_2 <- getConfusionMatrix(evaluate_result[[2]])
+
+accuracy_model_1_sum <- Reduce("+", accuracy_model_1)[, accuracy_colnames]
+accuracy_model_2_sum <- Reduce("+", accuracy_model_2)[, accuracy_colnames]
+
+accuracy_model_1_average <- accuracy_model_1_sum / 10
+accuracy_model_2_average <- accuracy_model_2_sum / 10
+
+rownames(accuracy_model_1_average) <- c("n=10", "n=50", "n=100", "n=250", "n=500")
+rownames(accuracy_model_2_average) <- c("n=10", "n=50", "n=100", "n=250", "n=500")
+
+accuracy_model_1_average
+accuracy_model_2_average
+```
+
+#
+* **plot**을 통해 ROC Curve 그래프 확인
+```{r}
+plot(evaluate_result, annotate = c(1,2), main = "ROC curve")
+```
